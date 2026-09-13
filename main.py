@@ -4193,7 +4193,10 @@ NEWS_TRENDS 热点分析报告
             server.login(from_email, password)
 
             # 发送邮件
-            server.send_message(msg)
+            # 用 sendmail 而非 send_message：后者在部分 Python 3.10 补丁版下
+            # 会对 compat32 策略执行 clone(utf8=True)，抛
+            # "'utf8' is an invalid keyword argument for Compat32"
+            server.sendmail(from_email, recipients, msg.as_string())
             server.quit()
 
             print(f"邮件发送成功 [{report_type}] -> {to_email}")
