@@ -4153,7 +4153,8 @@ def send_to_email(
         msg["Subject"] = subject
 
         # 设置其他标准 header
-        msg["MIME-Version"] = "1.0"
+        # 注意：EmailPolicy 会自动生成 MIME-Version，手动再设一次会报
+        # "There may be at most 1 MIME-Version headers in a message"
         msg["Date"] = formatdate(localtime=True)
         msg["Message-ID"] = make_msgid()
 
