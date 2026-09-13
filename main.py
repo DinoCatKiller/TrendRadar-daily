@@ -10,6 +10,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
+from email import policy as email_policy
 from email.utils import formataddr, formatdate, make_msgid
 from datetime import datetime
 from pathlib import Path
@@ -4129,7 +4130,9 @@ def send_to_email(
             smtp_port = 587
             use_tls = True
 
-        msg = MIMEMultipart("alternative")
+        # 显式指定 policy：compat32 没有 utf8 属性，某些 Python 3.10 补丁版下
+        # send_message() 会因 clone(utf8=True) 抛 TypeError
+        msg = MIMEMultipart("alternative", policy=email_policy.default)
 
         # 严格按照 RFC 标准设置 From header
         sender_name = "NEWS_TRENDS"
@@ -4193,10 +4196,7 @@ NEWS_TRENDS 热点分析报告
             server.login(from_email, password)
 
             # 发送邮件
-            # 用 sendmail 而非 send_message：后者在部分 Python 3.10 补丁版下
-            # 会对 compat32 策略执行 clone(utf8=True)，抛
-            # "'utf8' is an invalid keyword argument for Compat32"
-            server.sendmail(from_email, recipients, msg.as_string())
+            server.send_message(msg)
             server.quit()
 
             print(f"邮件发送成功 [{report_type}] -> {to_email}")
