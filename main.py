@@ -4148,7 +4148,9 @@ def send_to_email(
         # 设置邮件主题
         now = get_beijing_time()
         subject = f"NEWS_TRENDS 热点分析报告 - {report_type} - {now.strftime('%m月%d日 %H:%M')}"
-        msg["Subject"] = Header(subject, "utf-8")
+        # 使用 EmailPolicy 时直接赋字符串即可，email 会自动按 RFC 2047 编码中文；
+        # 传 Header 对象会触发 "'Header' object is not subscriptable"
+        msg["Subject"] = subject
 
         # 设置其他标准 header
         msg["MIME-Version"] = "1.0"
