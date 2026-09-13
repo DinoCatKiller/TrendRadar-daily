@@ -962,18 +962,20 @@ frequency_words.txt 文件增加了一个【必须词】功能，使用 + 号
       - 在 Telegram 中搜索 `@BotFather`（大小写注意，有蓝色徽章勾勾，有类似 37849827 monthly users，这个才是官方的，有一些仿官方的账号注意辨别）
       - 发送 `/newbot` 命令创建新机器人
       - 设置机器人名称（必须以"bot"结尾，很容易遇到重复名字，所以你要绞尽脑汁想不同的名字）
-      - 获取 Bot Token（格式如：`123456789:AAHfiqksKZ8WmR2zSjiQ7_v4TMAKdiHm9T0`）
+      - 获取 Bot Token（形如 `123456789:AABcD...` 的一串字符）
+      - ⚠️ 这串字符就是**机器人的密码**，任何人拿到都能以它的名义发消息。不要写进代码、README 或截图，只放进 GitHub Secret；一旦泄露，去 `@BotFather` 发送 `/revoke` 作废并重新生成
 
-   2. **获取 Chat ID**：
+   2. **获取 Chat ID**（就是"消息要发到哪个会话"的编号：私聊是正数，群组/频道是负数，如 `-1001234567890`）：
 
       **方法一：通过官方 API 获取**
-      - 先向你的机器人发送一条消息
-      - 访问：`https://api.telegram.org/bot<你的Bot Token>/getUpdates`
+      - ⚠️ 先给你的机器人**发一条消息**（`/start` 或任意文字），否则这里返回的是空数组
+      - 浏览器访问：`https://api.telegram.org/bot<你的Bot Token>/getUpdates`
       - 在返回的 JSON 中找到 `"chat":{"id":数字}` 中的数字
+      - 想发到**群组/频道**：把机器人拉进群并禁言无所谓，在群里发一条消息，再刷新这个地址，取该群对应的 `chat.id`
 
       **方法二：使用第三方工具**
       - 搜索 `@userinfobot` 并发送 `/start`
-      - 获取你的用户 ID 作为 Chat ID
+      - 获取你的用户 ID 作为 Chat ID（**仅适用于私聊**，群组必须用方法一）
 
    3. **配置到 GitHub**：
       - `TELEGRAM_BOT_TOKEN`：填入第 1 步获得的 Bot Token
