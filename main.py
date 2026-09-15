@@ -222,8 +222,15 @@ def load_config():
     config["AI_MAX_NEWS_IN_PROMPT"] = ai_section.get("max_news_in_prompt", 80)
     config["AI_TIMEOUT"] = ai_section.get("timeout", 120)
     config["AI_MAX_TOKENS"] = ai_section.get("max_tokens", 1500)
+    # 技术专栏篇幅更长，允许单独配置上限；未配置则回退到统一的 max_tokens
+    config["AI_TECH_MAX_TOKENS"] = ai_section.get(
+        "tech_max_tokens", ai_section.get("max_tokens", 1500)
+    )
     config["AI_TEMPERATURE"] = ai_section.get("temperature", 0.3)
     config["AI_PROMPT"] = ai_section.get("prompt", "")
+    config["AI_TECH_PROMPT"] = ai_section.get("tech_prompt", "")
+    # 技术专栏是否优先覆盖 RSS 官方源内容
+    config["AI_RSS_PRIORITY"] = ai_section.get("rss_priority", True)
 
     # 输出配置来源信息
     notification_sources = []
@@ -274,6 +281,10 @@ def get_rss_feed_id(feed: Dict) -> str:
     raw = str(feed.get("name") or feed.get("url", ""))
     slug = re.sub(r"[^0-9a-zA-Z]+", "_", raw).strip("_").lower()
     return f"rss_{slug or 'feed'}"
+
+
+# RSS 源的 id 集合：AI 分析时据此把官方源内容排到最前面重点覆盖
+RSS_SOURCE_IDS = {get_rss_feed_id(feed) for feed in CONFIG.get("RSS_FEEDS", [])}
 
 
 def get_monitored_source_ids() -> List[str]:
@@ -1370,6 +1381,7 @@ def count_word_frequency(
                     {
                         "title": title,
                         "source_name": source_name,
+                        "source_id": source_id,
                         "first_time": first_time,
                         "last_time": last_time,
                         "time_display": time_display,
@@ -1540,6 +1552,7 @@ def prepare_report_data(
             processed_title = {
                 "title": title_data["title"],
                 "source_name": title_data["source_name"],
+                "source_id": title_data.get("source_id", ""),
                 "time_display": title_data["time_display"],
                 "count": title_data["count"],
                 "ranks": title_data["ranks"],
@@ -3456,7 +3469,10 @@ def _render_ai_markdown(text: str) -> str:
 
 
 def _request_llm(
-    provider: Dict[str, str], system_prompt: str, user_prompt: str
+    provider: Dict[str, str],
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: Optional[int] = None,
 ) -> Tuple[Optional[str], str]:
     """请求单个 LLM provider，返回 (分析结果, 失败原因)"""
     headers = {
@@ -3470,7 +3486,7 @@ def _request_llm(
             {"role": "user", "content": user_prompt},
         ],
         "temperature": float(CONFIG.get("AI_TEMPERATURE", 0.3)),
-        "max_tokens": int(CONFIG.get("AI_MAX_TOKENS", 1500)),
+        "max_tokens": int(max_tokens or CONFIG.get("AI_MAX_TOKENS", 1500)),
     }
     base_url = str(provider.get("base_url", "")).rstrip("/")
     url = f"{base_url}/chat/completions"
@@ -3499,40 +3515,98 @@ def _request_llm(
         return None, f"调用异常: {e}"
 
 
-def _collect_news_entries(stats: List[Dict], max_news: int) -> List[Dict]:
-    """抽取新闻条目（去重），附带来源与链接，供 AI 分析并在结果里附上来源链接。"""
+def _is_rss_source(source_id: str) -> bool:
+    """判断来源是否为 RSS 订阅源（官方博客 / 发布日志等技术一手信息）"""
+    if not source_id:
+        return False
+    return source_id in RSS_SOURCE_IDS or source_id.startswith("rss_")
+
+
+def _collect_news_entries(
+    stats: List[Dict], max_news: int, prefer_rss: bool = False
+) -> List[Dict]:
+    """抽取新闻条目（去重），附带来源与链接，供 AI 分析并在结果里附上来源链接。
+
+    prefer_rss=True 时，RSS 官方源条目会被排到最前面，避免被热搜平台条目挤掉；
+    两组内部仍保持原始抓取顺序。
+    """
     seen: set = set()
-    entries: List[Dict] = []
+    rss_entries: List[Dict] = []
+    other_entries: List[Dict] = []
+    order = 0
+
     for group in stats:
         for item in (group.get("titles") or []):
             title = item.get("title", "")
             if not title or title in seen:
                 continue
             seen.add(title)
+            source_id = str(item.get("source_id", ""))
             url = str(item.get("url") or item.get("mobile_url") or "").strip()
-            entries.append({
+            entry = {
                 "source": item.get("source_name", ""),
+                "source_id": source_id,
+                "is_rss": _is_rss_source(source_id),
                 "title": title,
                 "url": url,
-            })
-            if len(entries) >= max_news:
-                return entries
-    return entries
+                "order": order,
+            }
+            order += 1
+            if entry["is_rss"]:
+                rss_entries.append(entry)
+            else:
+                other_entries.append(entry)
+
+    if prefer_rss:
+        entries = rss_entries + other_entries
+    else:
+        entries = sorted(rss_entries + other_entries, key=lambda e: e["order"])
+
+    return entries[:max_news]
 
 
-def _build_news_prompt_text(entries: List[Dict]) -> str:
-    """把新闻条目拼成带编号与链接的文本，方便模型在分析时回溯来源。"""
-    lines = []
-    for i, e in enumerate(entries, 1):
-        line = f"{i}. [{e['source']}] {e['title']}"
-        if e["url"]:
-            line += f"\n   链接: {e['url']}"
-        lines.append(line)
-    return "\n".join(lines)
+def _build_news_prompt_text(
+    entries: List[Dict], group_by_source: bool = False
+) -> str:
+    """把新闻条目拼成带编号与链接的文本，方便模型在分析时回溯来源。
+
+    group_by_source=True 时按「RSS 官方源 / 热搜平台」分段，
+    让模型清楚哪些是一手技术信息，应当重点覆盖。
+    """
+
+    def render(items: List[Dict], start: int = 1) -> str:
+        lines = []
+        for i, e in enumerate(items, start):
+            line = f"{i}. [{e['source']}] {e['title']}"
+            if e["url"]:
+                line += f"\n   链接: {e['url']}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    if not group_by_source:
+        return render(entries)
+
+    rss_items = [e for e in entries if e.get("is_rss")]
+    other_items = [e for e in entries if not e.get("is_rss")]
+
+    blocks = []
+    if rss_items:
+        blocks.append(
+            "【RSS 官方源 / 技术博客】（重点关注）\n" + render(rss_items)
+        )
+    if other_items:
+        blocks.append(
+            "【热搜平台 / 其他来源】（补充背景）\n"
+            + render(other_items, len(rss_items) + 1)
+        )
+    return "\n\n".join(blocks)
 
 
 def _run_ai_analysis(
-    news_lines: List[str], system_prompt: str, user_prompt: str
+    news_lines: List[str],
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: Optional[int] = None,
 ) -> Tuple[Optional[str], str]:
     """对给定新闻条目跑一次 AI，多 provider 依次兜底，返回 (分析结果, 状态说明)"""
     if not news_lines:
@@ -3549,10 +3623,13 @@ def _run_ai_analysis(
         provider_name = provider.get("name", f"provider{index}")
         print(
             f"正在进行 AI 分析（{index}/{total} 尝试 {provider_name}），"
-            f"共 {len(news_lines)} 条新闻..."
+            f"共 {len(news_lines)} 条新闻"
+            f"（RSS 官方源 {sum(1 for e in news_lines if isinstance(e, dict) and e.get('is_rss'))} 条）..."
         )
 
-        content, error = _request_llm(provider, system_prompt, user_prompt)
+        content, error = _request_llm(
+            provider, system_prompt, user_prompt, max_tokens=max_tokens
+        )
         if content:
             print(f"AI 分析完成（{provider_name}）")
             return content, f"成功 via {provider_name}"
@@ -3602,30 +3679,55 @@ def generate_ai_tech_analysis(stats: List[Dict]) -> Tuple[Optional[str], str]:
         return None, "AI 分析未启用"
 
     max_news = int(CONFIG.get("AI_MAX_NEWS_IN_PROMPT", 80))
-    entries = _collect_news_entries(stats, max_news)
+    prefer_rss = bool(CONFIG.get("AI_RSS_PRIORITY", True))
+    entries = _collect_news_entries(stats, max_news, prefer_rss=prefer_rss)
+    if not entries:
+        return None, "没有可分析的新闻"
+
+    max_tokens = int(CONFIG.get("AI_TECH_MAX_TOKENS", 0)) or None
     system_prompt = (
         "你是一名面向开发者的技术专栏作者，精通编程语言、框架、工具链与云原生生态，"
         "善于把零散的版本发布与技术动态串成有工程价值的解读。"
+        "你的读者是每天只有碎片时间的一线开发者，需要你讲清楚「发生了什么、关我什么事、该不该动」。"
     )
-    news_text = _build_news_prompt_text(entries)
+    news_text = _build_news_prompt_text(entries, group_by_source=prefer_rss)
+    rss_count = sum(1 for e in entries if e.get("is_rss"))
+    coverage_hint = (
+        f"上面共 {len(entries)} 条素材，其中 {rss_count} 条来自 RSS 官方源 / 技术博客"
+        "（已归入【RSS 官方源 / 技术博客】分组）。\n"
+        "这些官方源是今天的一手技术信息，必须优先覆盖："
+        "凡是有实质内容可讲（带版本号 / API / 新特性）的官方更新，都要在正文里提到并解读，"
+        "不要只挑 3-5 条敷衍过去。\n"
+        "【热搜平台 / 其他来源】的条目只作为背景补充，仅在与技术强相关时才写。"
+    )
     link_instruction = (
-        "撰写时请尽量点名具体新闻标题，并在每条解读末尾用 Markdown 链接格式"
+        "撰写时请点名具体新闻标题，并在每条解读末尾用 Markdown 链接格式"
         "附上对应来源链接，例如：`（来源：[新闻标题](链接)）`。"
         "链接请使用上面每条新闻给出的「链接:」地址，方便读者点击溯源。"
     )
     user_prompt = (
-        "以下是今天抓取到的热点新闻标题（格式为 [来源平台] 标题，并附链接），其中大量来自各技术官网的"
-        "官方博客、版本发布说明与更新日志：\n\n"
-        f"{news_text}\n\n"
-        "请从中筛选技术向内容，用简体中文写一篇「技术专栏」解读，要求：\n"
-        "1. 先一句话点明今天技术圈最值得关注的 1-2 个发布或变化；\n"
-        "2. 挑出 3-5 条具体技术动态逐条解读（如某语言/框架的新版本、重要 API 变更、工具更新），"
-        "说明它是什么、对开发者有什么实际影响、是否值得升级或尝鲜；\n"
-        "3. 若有教程、最佳实践或安全相关动态，单独提示。\n"
-        f"{link_instruction}\n"
-        "注意：聚焦技术内容，避免泛泛而谈社会热点；只输出解读，不要复述新闻列表。"
+        str(CONFIG.get("AI_TECH_PROMPT", "")).strip()
+        or (
+            "以下是今天抓取到的热点新闻标题（格式为 [来源平台] 标题，并附链接），"
+            "已按来源分组：\n\n"
+            f"{news_text}\n\n"
+            f"{coverage_hint}\n\n"
+            "请用简体中文写一篇信息量充足的「技术专栏」解读，要求：\n"
+            "1. 开篇用 2-3 句话点明今天技术圈最值得关注的发布或变化，并给出你的判断；\n"
+            "2. 主体按主题分小节（例如【语言与运行时】【前端与 UI】【工具链与基础设施】"
+            "【数据与存储】【AI 与大模型】【安全与最佳实践】，没有素材的小节直接省略），"
+            "每小节下逐条解读具体动态，每条都要写清三要素："
+            "①它是什么（点名具体项目 / 版本号 / API）；"
+            "②对开发者有什么实际影响（性能、兼容性、迁移成本等）；"
+            "③给一句明确建议：立刻跟进 / 尽快升级 / 观察一段时间 / 暂不需要；\n"
+            "3. 单独用一节列出安全公告、漏洞修复或最佳实践类动态（若有）；\n"
+            "4. 结尾写一段 150-250 字的趋势判断，说明哪些方向正在升温、哪些值得长期跟踪。\n"
+            f"{link_instruction}\n"
+            "篇幅要求：不少于 1200 字，充分展开，不要写成只有几个要点的提纲；"
+            "聚焦技术内容，避免泛泛而谈社会热点；不要复述新闻列表。"
+        )
     )
-    return _run_ai_analysis(entries, system_prompt, user_prompt)
+    return _run_ai_analysis(entries, system_prompt, user_prompt, max_tokens=max_tokens)
 
 
 def send_to_notifications(
