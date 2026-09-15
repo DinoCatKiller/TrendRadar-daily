@@ -1,5 +1,6 @@
 # coding=utf-8
 
+import calendar
 import json
 import os
 import random
@@ -12,7 +13,7 @@ from email.mime.multipart import MIMEMultipart
 from email.header import Header
 from email import policy as email_policy
 from email.utils import formataddr, formatdate, make_msgid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 
@@ -123,6 +124,12 @@ def load_config():
         "PLATFORMS": config_data["platforms"],
         "RSS_FEEDS": config_data.get("rss_feeds", []) or [],
     }
+
+    # RSS 官方源策略：免关键词过滤 + 只保留时间窗口内的文章
+    rss_options = config_data.get("rss") or {}
+    config["RSS_BYPASS_FILTER"] = rss_options.get("bypass_filter", True)
+    config["RSS_MAX_AGE_DAYS"] = int(rss_options.get("max_age_days", 30))
+    config["RSS_MAX_ENTRIES"] = int(rss_options.get("max_entries_per_feed", 100))
 
     # 通知渠道配置（环境变量优先）
     notification = config_data.get("notification", {})
@@ -285,6 +292,20 @@ def get_rss_feed_id(feed: Dict) -> str:
 
 # RSS 源的 id 集合：AI 分析时据此把官方源内容排到最前面重点覆盖
 RSS_SOURCE_IDS = {get_rss_feed_id(feed) for feed in CONFIG.get("RSS_FEEDS", [])}
+
+# 免过滤模式下，官方源内容统一归入这个词组，在报告里单独成节
+RSS_GROUP_KEY = "RSS 官方源订阅"
+
+
+def _parse_rss_entry_time(entry) -> Optional[datetime]:
+    """解析 RSS/Atom 条目的发布时间（UTC naive），无法解析时返回 None"""
+    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not parsed:
+        return None
+    try:
+        return datetime.utcfromtimestamp(calendar.timegm(parsed))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def get_monitored_source_ids() -> List[str]:
@@ -627,9 +648,23 @@ class DataFetcher:
         print(f"成功: {list(results.keys())}, 失败: {failed_ids}")
         return results, id_to_name, failed_ids
 
-    def fetch_rss_feed(self, url: str, max_entries: int = 30) -> Dict[str, Dict]:
-        """抓取并解析单个 RSS/Atom 源，返回与热搜同构的 items 结构"""
+    def fetch_rss_feed(
+        self,
+        url: str,
+        max_entries: Optional[int] = None,
+        max_age_days: Optional[int] = None,
+    ) -> Dict[str, Dict]:
+        """抓取并解析单个 RSS/Atom 源，返回与热搜同构的 items 结构
+
+        max_age_days > 0 时只保留发布时间在该天数以内的文章；
+        条目本身没有发布时间的，保守保留。
+        """
         import feedparser
+
+        if max_entries is None:
+            max_entries = int(CONFIG.get("RSS_MAX_ENTRIES", 100))
+        if max_age_days is None:
+            max_age_days = int(CONFIG.get("RSS_MAX_AGE_DAYS", 30))
 
         proxies = None
         if self.proxy_url:
@@ -644,13 +679,37 @@ class DataFetcher:
         response.raise_for_status()
         parsed = feedparser.parse(response.content)
 
+        cutoff = (
+            datetime.utcnow() - timedelta(days=max_age_days)
+            if max_age_days > 0
+            else None
+        )
+
         items: Dict[str, Dict] = {}
-        for index, entry in enumerate(parsed.entries[:max_entries], 1):
+        outdated = 0
+        for entry in parsed.entries:
+            if len(items) >= max_entries:
+                break
+
             title = (entry.get("title") or "").strip()
             if not title or title in items:
                 continue
+
+            if cutoff is not None:
+                published = _parse_rss_entry_time(entry)
+                if published and published < cutoff:
+                    outdated += 1
+                    continue
+
             link = (entry.get("link") or "").strip()
-            items[title] = {"ranks": [index], "url": link, "mobileUrl": link}
+            items[title] = {
+                "ranks": [len(items) + 1],
+                "url": link,
+                "mobileUrl": link,
+            }
+
+        if outdated:
+            print(f"  已跳过 {outdated} 条超过 {max_age_days} 天的历史文章")
         return items
 
     def crawl_rss_feeds(
@@ -1256,7 +1315,17 @@ def count_word_frequency(
     if new_titles is None:
         new_titles = {}
 
-    for group in word_groups:
+    # RSS 官方源免关键词过滤：额外建一个分组承载官方源内容
+    rss_bypass = bool(CONFIG.get("RSS_BYPASS_FILTER")) and bool(
+        RSS_SOURCE_IDS.intersection(results_to_process.keys())
+    )
+    all_word_groups = (
+        word_groups + [{"required": [], "normal": [], "group_key": RSS_GROUP_KEY}]
+        if rss_bypass
+        else word_groups
+    )
+
+    for group in all_word_groups:
         group_key = group["group_key"]
         word_stats[group_key] = {"count": 0, "titles": {}}
 
@@ -1266,14 +1335,19 @@ def count_word_frequency(
         if source_id not in processed_titles:
             processed_titles[source_id] = {}
 
+        rss_source = rss_bypass and source_id in RSS_SOURCE_IDS
+
         for title, title_data in titles_data.items():
             if title in processed_titles.get(source_id, {}):
                 continue
 
-            # 使用统一的匹配逻辑
-            matches_frequency_words = matches_word_groups(
-                title, word_groups, filter_words
-            )
+            # RSS 官方源直接放行，其余仍走统一的关键词匹配
+            if rss_source:
+                matches_frequency_words = True
+            else:
+                matches_frequency_words = matches_word_groups(
+                    title, word_groups, filter_words
+                )
 
             if not matches_frequency_words:
                 continue
@@ -1289,9 +1363,14 @@ def count_word_frequency(
             source_mobile_url = title_data.get("mobileUrl", "")
             if isinstance(title, float):
                 title = str(title)
-            # 找到匹配的词组
+            # 找到匹配的词组（RSS 官方源统一归入 RSS 分组，不做词组归属判断）
             title_lower = title.lower()
-            for group in word_groups:
+            groups_to_check = (
+                [{"required": [], "normal": [], "group_key": RSS_GROUP_KEY}]
+                if rss_source
+                else word_groups
+            )
+            for group in groups_to_check:
                 required_words = group["required"]
                 normal_words = group["normal"]
 
@@ -1504,8 +1583,14 @@ def prepare_report_data(
             word_groups, filter_words = load_frequency_words()
             for source_id, titles_data in new_titles.items():
                 filtered_titles = {}
+                rss_source = (
+                    bool(CONFIG.get("RSS_BYPASS_FILTER"))
+                    and source_id in RSS_SOURCE_IDS
+                )
                 for title, title_data in titles_data.items():
-                    if matches_word_groups(title, word_groups, filter_words):
+                    if rss_source or matches_word_groups(
+                        title, word_groups, filter_words
+                    ):
                         filtered_titles[title] = title_data
                 if filtered_titles:
                     filtered_new_titles[source_id] = filtered_titles
@@ -1523,6 +1608,7 @@ def prepare_report_data(
                     processed_title = {
                         "title": title,
                         "source_name": source_name,
+                        "source_id": source_id,
                         "time_display": "",
                         "count": 1,
                         "ranks": ranks,
