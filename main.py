@@ -695,17 +695,17 @@ class DataFetcher:
             if not title or title in items:
                 continue
 
-            if cutoff is not None:
-                published = _parse_rss_entry_time(entry)
-                if published and published < cutoff:
-                    outdated += 1
-                    continue
+            published = _parse_rss_entry_time(entry)
+            if cutoff is not None and published and published < cutoff:
+                outdated += 1
+                continue
 
             link = (entry.get("link") or "").strip()
             items[title] = {
                 "ranks": [len(items) + 1],
                 "url": link,
                 "mobileUrl": link,
+                "published": published.strftime("%Y-%m-%d") if published else "",
             }
 
         if outdated:
@@ -1361,6 +1361,7 @@ def count_word_frequency(
             source_ranks = title_data.get("ranks", [])
             source_url = title_data.get("url", "")
             source_mobile_url = title_data.get("mobileUrl", "")
+            source_published = title_data.get("published", "")
             if isinstance(title, float):
                 title = str(title)
             # 找到匹配的词组（RSS 官方源统一归入 RSS 分组，不做词组归属判断）
@@ -1461,6 +1462,7 @@ def count_word_frequency(
                         "title": title,
                         "source_name": source_name,
                         "source_id": source_id,
+                        "published": source_published,
                         "first_time": first_time,
                         "last_time": last_time,
                         "time_display": time_display,
@@ -1639,6 +1641,7 @@ def prepare_report_data(
                 "title": title_data["title"],
                 "source_name": title_data["source_name"],
                 "source_id": title_data.get("source_id", ""),
+                "published": title_data.get("published", ""),
                 "time_display": title_data["time_display"],
                 "count": title_data["count"],
                 "ranks": title_data["ranks"],
@@ -3635,6 +3638,7 @@ def _collect_news_entries(
                 "is_rss": _is_rss_source(source_id),
                 "title": title,
                 "url": url,
+                "published": str(item.get("published", "")),
                 "order": order,
             }
             order += 1
@@ -3644,6 +3648,8 @@ def _collect_news_entries(
                 other_entries.append(entry)
 
     if prefer_rss:
+        # RSS 条目按发布日期从新到旧排（无日期的落到最后，保持原顺序）
+        rss_entries.sort(key=lambda e: e.get("published") or "", reverse=True)
         entries = rss_entries + other_entries
     else:
         entries = sorted(rss_entries + other_entries, key=lambda e: e["order"])
@@ -3663,7 +3669,9 @@ def _build_news_prompt_text(
     def render(items: List[Dict], start: int = 1) -> str:
         lines = []
         for i, e in enumerate(items, start):
-            line = f"{i}. [{e['source']}] {e['title']}"
+            published = e.get("published") or ""
+            date_hint = f"（{published}）" if published else ""
+            line = f"{i}. [{e['source']}] {e['title']}{date_hint}"
             if e["url"]:
                 line += f"\n   链接: {e['url']}"
             lines.append(line)
@@ -3677,9 +3685,19 @@ def _build_news_prompt_text(
 
     blocks = []
     if rss_items:
-        blocks.append(
-            "【RSS 官方源 / 技术博客】（重点关注）\n" + render(rss_items)
+        recent_cutoff = (datetime.utcnow() - timedelta(days=7)).strftime(
+            "%Y-%m-%d"
         )
+        recent_count = sum(
+            1
+            for e in rss_items
+            if (e.get("published") or "") >= recent_cutoff
+        )
+        header = (
+            f"【RSS 官方源 / 技术博客】（重点关注，已按发布时间从新到旧排列；"
+            f"共 {len(rss_items)} 条，其中最近 7 天 {recent_count} 条）"
+        )
+        blocks.append(header + "\n" + render(rss_items))
     if other_items:
         blocks.append(
             "【热搜平台 / 其他来源】（补充背景）\n"
@@ -3784,7 +3802,12 @@ def generate_ai_tech_analysis(stats: List[Dict]) -> Tuple[Optional[str], str]:
         "这些官方源是今天的一手技术信息，必须优先覆盖："
         "凡是有实质内容可讲（带版本号 / API / 新特性）的官方更新，都要在正文里提到并解读，"
         "不要只挑 3-5 条敷衍过去。\n"
-        "【热搜平台 / 其他来源】的条目只作为背景补充，仅在与技术强相关时才写。"
+        "【热搜平台 / 其他来源】的条目只作为背景补充，仅在与技术强相关时才写。\n"
+        "时间线要求：RSS 素材已按发布时间从新到旧排列，标题后括号内是发布日期。\n"
+        "必须优先解读时间线最近的内容 —— 最近 3-7 天的更新放在最前面、写得最充分；\n"
+        "同一主题出现多条时以最新那条为准（旧的结论被新的推翻时按新的讲），\n"
+        "更久远的动态只在同一主题需要补充背景时一句带过。\n"
+        "严禁出现「只顾着分析排列靠前的条目、把最近的更新漏掉」的情况。"
     )
     link_instruction = (
         "撰写时请点名具体新闻标题，并在每条解读末尾用 Markdown 链接格式"
