@@ -130,6 +130,8 @@ def load_config():
     config["RSS_BYPASS_FILTER"] = rss_options.get("bypass_filter", True)
     config["RSS_MAX_AGE_DAYS"] = int(rss_options.get("max_age_days", 30))
     config["RSS_MAX_ENTRIES"] = int(rss_options.get("max_entries_per_feed", 100))
+    # 每个源只保留最新的几条（按发布时间倒序），0 = 不按条数限制
+    config["RSS_LATEST_PER_FEED"] = int(rss_options.get("latest_per_feed", 1))
 
     # 通知渠道配置（环境变量优先）
     notification = config_data.get("notification", {})
@@ -653,11 +655,13 @@ class DataFetcher:
         url: str,
         max_entries: Optional[int] = None,
         max_age_days: Optional[int] = None,
+        latest_per_feed: Optional[int] = None,
     ) -> Dict[str, Dict]:
         """抓取并解析单个 RSS/Atom 源，返回与热搜同构的 items 结构
 
         max_age_days > 0 时只保留发布时间在该天数以内的文章；
-        条目本身没有发布时间的，保守保留。
+        latest_per_feed > 0 时，按发布时间倒序只保留每个源最新的 N 条；
+        条目本身没有发布时间的，排在能解析出时间的条目之后。
         """
         import feedparser
 
@@ -665,6 +669,8 @@ class DataFetcher:
             max_entries = int(CONFIG.get("RSS_MAX_ENTRIES", 100))
         if max_age_days is None:
             max_age_days = int(CONFIG.get("RSS_MAX_AGE_DAYS", 30))
+        if latest_per_feed is None:
+            latest_per_feed = int(CONFIG.get("RSS_LATEST_PER_FEED", 1))
 
         proxies = None
         if self.proxy_url:
@@ -685,14 +691,13 @@ class DataFetcher:
             else None
         )
 
-        items: Dict[str, Dict] = {}
+        collected: List[Tuple[str, str, Optional[datetime]]] = []
         outdated = 0
-        for entry in parsed.entries:
-            if len(items) >= max_entries:
-                break
+        seen_titles: set = set()
 
+        for entry in parsed.entries:
             title = (entry.get("title") or "").strip()
-            if not title or title in items:
+            if not title or title in seen_titles:
                 continue
 
             published = _parse_rss_entry_time(entry)
@@ -700,9 +705,24 @@ class DataFetcher:
                 outdated += 1
                 continue
 
+            seen_titles.add(title)
             link = (entry.get("link") or "").strip()
+            collected.append((title, link, published))
+
+        # 按发布时间倒序：能解析出时间的最新在前，解析不出时间的排在其后
+        collected.sort(
+            key=lambda item: (1, item[2].timestamp()) if item[2] else (0, 0),
+            reverse=True,
+        )
+        if latest_per_feed > 0:
+            collected = collected[:latest_per_feed]
+        elif max_entries > 0:
+            collected = collected[:max_entries]
+
+        items: Dict[str, Dict] = {}
+        for index, (title, link, published) in enumerate(collected, 1):
             items[title] = {
-                "ranks": [len(items) + 1],
+                "ranks": [index],
                 "url": link,
                 "mobileUrl": link,
                 "published": published.strftime("%Y-%m-%d") if published else "",
@@ -3803,11 +3823,9 @@ def generate_ai_tech_analysis(stats: List[Dict]) -> Tuple[Optional[str], str]:
         "凡是有实质内容可讲（带版本号 / API / 新特性）的官方更新，都要在正文里提到并解读，"
         "不要只挑 3-5 条敷衍过去。\n"
         "【热搜平台 / 其他来源】的条目只作为背景补充，仅在与技术强相关时才写。\n"
-        "时间线要求：RSS 素材已按发布时间从新到旧排列，标题后括号内是发布日期。\n"
-        "必须优先解读时间线最近的内容 —— 最近 3-7 天的更新放在最前面、写得最充分；\n"
-        "同一主题出现多条时以最新那条为准（旧的结论被新的推翻时按新的讲），\n"
-        "更久远的动态只在同一主题需要补充背景时一句带过。\n"
-        "严禁出现「只顾着分析排列靠前的条目、把最近的更新漏掉」的情况。"
+        "时间线要求：RSS 分组里每个订阅源只保留了最新的一条，标题后括号内是发布日期。\n"
+        "这些就是各官方源当下的最新动态，请逐条解读，不要挑着写、也不要遗漏；\n"
+        "若某条日期明显偏旧（超过一周），说明该源近期没有更新，一句带过即可。\n"
     )
     link_instruction = (
         "撰写时请点名具体新闻标题，并在每条解读末尾用 Markdown 链接格式"

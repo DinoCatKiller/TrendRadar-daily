@@ -200,7 +200,8 @@ platforms:
 rss:
   bypass_filter: true # 官方源内容免过 frequency_words 关键词筛选，直接进入报告
   max_age_days: 30 # 只保留最近 30 天发布的文章（0 = 不限时间）
-  max_entries_per_feed: 100 # 每个源最多抓取多少条（先按时间过滤，再截条数）
+  latest_per_feed: 1 # 每个源只保留最新几条（按发布时间倒序；0 = 不按条数限制）
+  max_entries_per_feed: 100 # latest_per_feed 为 0 时启用的兜底上限
 
 rss_feeds:
   # --- 程序设计语言 ---
