@@ -244,6 +244,9 @@ rss_feeds:
   # --- 版本控制 & 协作 ---
   - name: "GitHub 官方博客"
     url: "https://github.blog/feed/"
+  # --- AI & 加速计算 ---
+  - name: "NVIDIA 开发者博客"
+    url: "https://developer.nvidia.com/blog/feed/"
 
 # ======================================================
 # AI 智能分析（自动把大模型解读写进推送邮件）
