@@ -211,6 +211,8 @@ rss_feeds:
     url: "https://go.dev/blog/feed.atom"
   - name: "Rust 官方博客"
     url: "https://blog.rust-lang.org/feed.xml"
+  - name: "Tokio 官方博客"
+    url: "https://tokio.rs/blog/index.xml"
   - name: "Dart/Flutter 官方博客"
     url: "https://medium.com/feed/dartlang"
   # --- 前端 & UI ---
